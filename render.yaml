@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: prompt-match
-    runtime: python
+    name: prompt-match-live
+    runtime: docker
     plan: free
-    buildCommand: npm --prefix hackharvard_frontend ci && npm --prefix hackharvard_frontend run build && pip install -r requirements.txt
-    startCommand: python -m stablediffusion_dixit.backend.endpoints
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
     envVars:
       - key: OPENAI_API_KEY
         sync: false
