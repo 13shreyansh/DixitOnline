@@ -22,10 +22,9 @@ function PlayerList(props) {
                     { items }
                 </ul>
             </div>
-          <Button label={"StartGame"} onClick={handleStartGame}></Button>
+          <Button label={"Start Prompt Match"} onClick={handleStartGame}></Button>
         </div>
     )
 }
 
 export default PlayerList
-

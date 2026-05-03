@@ -1,7 +1,6 @@
 import './App.css'
 import socket from './socketConfig'
 
-import ActivePlayerClue from 'src/frames/active/clue'
 import RoleSelect from 'src/frames/roleSelect.jsx'
 import WaitingScreen from 'src/frames/wait.jsx'
 import PlayerResults from 'src/frames/playerResults'
@@ -11,8 +10,8 @@ import { useEffect, useState } from 'react'
 import BotVote from './frames/bot/vote'
 import Vote from './frames/tv/vote.jsx'
 import PlayerList from "./frames/tv/playerList.jsx";
-import ResultsTv from "./frames/tv/resultsTv.jsx";
 import TvResults from "./frames/tv/resultsTv.jsx";
+import Target from "./frames/tv/target.jsx";
 
 function App() {
   const [gameState, setGameState] = useState("role_select");
@@ -22,12 +21,6 @@ function App() {
     socket.on("display_waiting_screen", (msg) => {
       console.log("Display waiting")
       setGameState("wait");
-      setFrameInfo(msg);
-    });
-
-    socket.on("display_active_player_ok", (msg) => {
-      console.log("Display active player ok")
-      setGameState("active_player_clue");
       setFrameInfo(msg);
     });
 
@@ -61,6 +54,12 @@ function App() {
       setFrameInfo(msg);
     });
 
+    socket.on("tv_show_target", (msg) => {
+      console.log("Tv show target");
+      setGameState("tv_target");
+      setFrameInfo(msg);
+    });
+
     socket.on("tv_display_results", (msg) => {
       console.log("Tv display results");
       setGameState("tv_results");
@@ -83,14 +82,6 @@ function App() {
     return (
       <div id="app_frame">
         <WaitingScreen info={frameInfo} />
-      </div>
-    )
-  }
-
-  if (gameState == "active_player_clue") {
-    return (
-      <div id="app_frame">
-        <ActivePlayerClue info={frameInfo} />
       </div>
     )
   }
@@ -122,10 +113,12 @@ function App() {
   let screen = [];
   if(gameState === "lobby"){
     screen.push(<PlayerList key={"playerlist"} names={frameInfo.names}></PlayerList>)
+  } else if(gameState === "tv_target"){
+    screen.push(<Target key={"target"} info={frameInfo}></Target>)
   } else if(gameState === "tv_vote"){
-    screen.push(<Vote key={"vote"} images={frameInfo.images}></Vote>)
+    screen.push(<Vote key={"vote"} target_image={frameInfo.target_image} images={frameInfo.images}></Vote>)
   } else if(gameState === "tv_results"){
-    screen.push(<TvResults images={frameInfo.images} players={frameInfo.players}></TvResults>)
+    screen.push(<TvResults target_image={frameInfo.target_image} target_prompt={frameInfo.target_prompt} images={frameInfo.images} players={frameInfo.players}></TvResults>)
   }
 
   return (

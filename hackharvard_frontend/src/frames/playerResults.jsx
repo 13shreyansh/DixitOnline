@@ -13,25 +13,7 @@ import "./playerResults.css"
 
 
 function PlayerResults(props) {
-    var result_banner;
-    if (props.info.result == "everybody") {
-        result_banner = "Everybody guessed the image!";
-    }
-    else if (props.info.result == "nobody") {
-        result_banner = "Nobody guessed the image!";
-    }
-    else if (props.info.result == "split") {
-        if (props.info.is_active_player) {
-            result_banner = "Split guess!";
-        }
-        else if (props.info.guessed_active_player) {
-            result_banner = "You got it!";
-        }
-        else {
-            result_banner = "Wrong!";
-        }
-
-    }
+    const result_banner = props.info.message || "Round complete";
 
     return (
         <div id="player_results_container">
@@ -39,10 +21,10 @@ function PlayerResults(props) {
                 {result_banner}
             </div>
             <div id="pr_round_score">
-                round score: <bold>{props.info.player_round_score}</bold>
+                round score: <strong>{props.info.player_round_score}</strong>
             </div>
             <div id="pr_total_score">
-                total score: <bold>{props.info.player_total_score}</bold>
+                total score: <strong>{props.info.player_total_score}</strong>
             </div>
         </div>
     )

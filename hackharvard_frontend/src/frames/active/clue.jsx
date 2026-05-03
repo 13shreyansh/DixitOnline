@@ -17,18 +17,18 @@ function ActivePlayerClue(props) {
 
     function handleAPCDone() {
       socket.emit("active_player_proceed", {})
-        console.log('Done sharing clue');
+        console.log('Done');
     }
 
     return (
         <div id="clue_container">
             <div id="apc_info" className="info_text">
-                {"You are the active player."}
+                {"Your image is ready."}
                 <br />
-                {"Share your clue with the other players!"}
+                {"Move to the next step when everyone has seen the TV."}
             </div>
            <div className={"card_image"}>
-             <img src={backend_url + props.info.image} alt="Dixit card" />
+             <img src={backend_url + props.info.image} alt="Generated card" />
            </div>
             <Button label="Done" onClick={handleAPCDone} />
         </div >

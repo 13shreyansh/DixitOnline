@@ -9,15 +9,16 @@ function BotVote(props) {
     socket.emit("vote", {"vote": num})
   }
 
-  for(let i = 0; i < props.info.number; i++){
+  let options = props.info.options || Array.from({length: props.info.number}, (_, index) => ({index}));
+  for(let option of options){
     vote_buttons.push(
-        <Button id="votes" key={i} label={i} onClick={()=>voteFor(i)} clickable={true}></Button>
+        <Button id="votes" key={option.index} label={option.index + 1} onClick={()=>voteFor(option.index)} clickable={true}></Button>
     )
   }
     return (
         <div id="vote_container">
           <div id="wait_info">
-            Vote for the image that best matches the prompt!
+            Vote for the closest match on the TV. The images are anonymous.
           </div>
           <div id="vote_button_container">
             {vote_buttons}

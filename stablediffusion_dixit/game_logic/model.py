@@ -1,414 +1,470 @@
 import enum
 import random
 import threading
+from time import sleep
 
-from stablediffusion_dixit.image_generation.local_generation.local_image_generator import LocalImageGenerator
-from flask_socketio import SocketIO, emit
-from time import *
+from flask_socketio import emit
+
+
+TARGET_PROMPTS = [
+    "a tiny astronaut running a ramen shop on the moon",
+    "a haunted vending machine in a luxury hotel lobby",
+    "a dragon trying to use an office printer",
+    "a royal portrait of a cat made of thunderclouds",
+    "a submarine full of houseplants crossing a desert",
+    "a wizard stuck in airport security with glowing luggage",
+    "a cozy cafe inside a giant glass snow globe",
+    "a robot barber giving haircuts to chess pieces",
+    "a pirate ship sailing through a bowl of cereal",
+    "a lonely lighthouse wearing sneakers on a foggy beach",
+    "a medieval knight hosting a late night cooking show",
+    "a city skyline growing out of an old piano",
+    "a detective duck investigating a neon noodle factory",
+    "a library where every book is a tiny aquarium",
+    "a tea party for ghosts on top of a moving train",
+    "a sushi chef preparing dinner for planets in orbit",
+    "a sleepy volcano tucked into bed with a nightlight",
+    "a circus tent floating in a thunderstorm over Tokyo",
+    "a garden gnome piloting a cardboard spaceship",
+    "a golden retriever CEO presenting charts to penguins",
+    "a secret disco inside an ancient Egyptian pyramid",
+    "a moonlit laundromat where socks become butterflies",
+]
+
+CHALLENGES = [
+    {
+        "title": "No Color Words",
+        "description": "Do not use color words like red, blue, green, gold, black, or white.",
+        "banned_words": ["red", "blue", "green", "yellow", "gold", "golden", "black", "white", "purple", "pink", "orange"],
+    },
+    {
+        "title": "No Main Subject",
+        "description": "Avoid naming the most obvious main object. Describe the scene around it instead.",
+        "banned_words": [],
+    },
+    {
+        "title": "Movie Poster Mode",
+        "description": "Make your prompt sound like a dramatic movie poster.",
+        "banned_words": [],
+    },
+    {
+        "title": "Five Words Max",
+        "description": "Use five words or fewer.",
+        "banned_words": [],
+        "max_words": 5,
+    },
+    {
+        "title": "No People",
+        "description": "Do not mention humans, people, person, man, woman, boy, or girl.",
+        "banned_words": ["human", "humans", "people", "person", "man", "woman", "boy", "girl"],
+    },
+    {
+        "title": "One Sentence",
+        "description": "Write exactly one sentence. No comma-separated shopping list.",
+        "banned_words": [],
+    },
+    {
+        "title": "Tiny Detail First",
+        "description": "Begin with a small detail, then describe the rest of the image.",
+        "banned_words": [],
+    },
+    {
+        "title": "No Style Words",
+        "description": "Do not use art-style words like cinematic, realistic, illustration, painting, or photo.",
+        "banned_words": ["cinematic", "realistic", "illustration", "painting", "photo", "photograph", "render", "style"],
+    },
+    {
+        "title": "Child Explains It",
+        "description": "Write like a kid describing the picture to a friend.",
+        "banned_words": [],
+    },
+    {
+        "title": "Museum Label",
+        "description": "Write like a serious museum label for a very unserious scene.",
+        "banned_words": [],
+    },
+]
+
+
+def create_image_generator():
+    import os
+
+    if os.environ.get("DIXIT_USE_STABLE_DIFFUSION") == "1":
+        from stablediffusion_dixit.image_generation.local_generation.local_image_generator import LocalImageGenerator
+
+        return LocalImageGenerator()
+
+    if os.environ.get("OPENAI_API_KEY"):
+        from stablediffusion_dixit.image_generation.openai_image_generator import OpenAIImageGenerator
+
+        return OpenAIImageGenerator()
+
+    from stablediffusion_dixit.image_generation.mock_image_generator import MockImageGenerator
+
+    return MockImageGenerator()
+
 
 class GamePhase(enum.Enum):
     WaitingToStart = 0
-    ActivePlayerPrompt = 1
-    ActivePlayerImageWait = 2
-    ActivePlayerGiveClue = 3
-    AllPlayersPrompt = 4
-    AllPlayersImageWait = 5
-    SelectActiveImage = 6
-    ShowResults = 7
+    TargetImageWait = 1
+    PlayerPrompts = 2
+    PlayerImageWait = 3
+    VoteClosest = 4
+    ShowResults = 5
 
-    def trigger_state(self, state):
-        if self.value == 0:
-            return
-        elif self.value == 1:
-            state.active_player_write_prompt()
-        elif self.value == 2:
-            state.active_player_wait()
-        elif self.value == 3:
-            state.active_player_give_clue()
-        elif self.value == 4:
-            state.non_active_players_give_prompt()
-        elif self.value == 5:
-            state.non_active_players_wait()
-        elif self.value == 6:
-            state.non_active_players_vote()
-        elif self.value == 7:
-            state.show_results()
-        else:
-            print("reached strange state")
-            exit()
 
 class GameState:
-    def __init__(self, app):
+    def __init__(self, app, socketio=None):
         self.app = app
-        self.image_generator = LocalImageGenerator()
-
+        self.socketio = socketio
+        self.image_generator = create_image_generator()
         self.phase = GamePhase.WaitingToStart
-        self.players = []  # Player object
-        self.active_player = 0  # Index
-        self.active_players_image = None
-        self.active_players_image_ticket = None
-        self.other_players_images = {} # sids to png
-        self.other_players_image_tickets = {} # sids to index
-        self.card_order = None
+        self.players = []
+        self.pending_players = []
         self.tvs = []
-        self.votes = {}
-        self.round_scores = {}
-        self.images = []
-        self.prompts = {} # Sid -> Prompt
+        self.round_number = 0
+        self.round_timer = None
+        self.reset_round_state()
 
-        self.anims_this_round = []
-        self.anims_prev_rounds = []
-        self.phase.trigger_state(self)
+    def emit(self, event, payload, **kwargs):
+        if self.socketio is not None:
+            self.socketio.emit(event, payload, **kwargs)
+        else:
+            emit(event, payload, **kwargs)
+
+    def add_player(self, player):
+        if self.get_player(player.sid) is not None:
+            return
+        if self.phase == GamePhase.WaitingToStart:
+            self.players.append(player)
+            self.emit("display_waiting_screen", {
+                "state": "Wait for the TV to start Prompt Match.",
+                "image": self.get_random_animation(),
+            }, to=player.sid)
+            self.emit_lobby()
+        elif self.phase in (GamePhase.TargetImageWait, GamePhase.PlayerPrompts):
+            self.players.append(player)
+            if self.phase == GamePhase.PlayerPrompts and self.target_image is not None:
+                self.emit("display_prompt", {
+                    "mode": "match",
+                    "promptInfo": "Write a prompt to recreate the target image on the TV.",
+                    "target_image": self.target_image,
+                    "challenge": self.challenges.get(player.sid),
+                }, to=player.sid)
+                self.emit_target()
+            else:
+                self.emit("display_waiting_screen", {
+                    "state": "Generating the target image.",
+                    "image": self.get_random_animation(),
+                }, to=player.sid)
+        else:
+            self.pending_players.append(player)
+            self.emit("display_waiting_screen", {
+                "state": "A round is already running. You will join the next one.",
+                "image": self.get_random_animation(),
+            }, to=player.sid)
+
+    def add_tv(self, sid):
+        if sid not in self.tvs:
+            self.tvs.append(sid)
+        if self.phase == GamePhase.WaitingToStart:
+            self.emit_lobby(to=sid)
+        elif self.target_image is not None:
+            self.emit_target(to=sid)
+        else:
+            self.emit("display_waiting_screen", {
+                "state": "Generating the target image.",
+                "image": self.get_random_animation(),
+            }, to=sid)
+
+    def remove_sid(self, sid):
+        if sid in self.tvs:
+            self.tvs.remove(sid)
+            return
+
+        player = self.get_player(sid)
+        if player is None:
+            self.pending_players = [pending for pending in self.pending_players if pending.sid != sid]
+            return
+
+        self.players.remove(player)
+        if not self.players:
+            self.reset_to_lobby()
+            return
+
+        if self.phase == GamePhase.WaitingToStart:
+            self.emit_lobby()
+        elif self.phase in (GamePhase.PlayerPrompts, GamePhase.PlayerImageWait, GamePhase.VoteClosest):
+            self.prompts.pop(sid, None)
+            self.submission_tickets.pop(sid, None)
+            self.submission_images.pop(sid, None)
+            self.votes.pop(sid, None)
+            if self.phase == GamePhase.VoteClosest:
+                self.card_order = [player_sid for player_sid in self.card_order if player_sid != sid]
+                self.emit_vote_screen()
+                self.check_votes_complete()
+            else:
+                self.check_submissions_complete()
 
     def start_game(self):
-        self.phase = GamePhase.ActivePlayerPrompt
-        self.phase.trigger_state(self)
-    def get_player(self,sid):
+        if self.pending_players:
+            existing_sids = {player.sid for player in self.players}
+            self.players.extend(player for player in self.pending_players if player.sid not in existing_sids)
+            self.pending_players = []
+
+        if not self.players:
+            self.emit_lobby()
+            return
+
+        self.round_number += 1
+        self.reset_round_state()
+        self.assign_challenges()
+        self.phase = GamePhase.TargetImageWait
+        self.target_prompt = random.choice(TARGET_PROMPTS)
+        self.target_image_ticket = self.image_generator.request_generation(
+            self.target_prompt,
+            callback=self.receive_target_finished_generating,
+        )
+        self.emit_waiting_to_all("Generating the target image.")
+
+    def receive_prompt(self, sid, prompt):
+        if self.phase != GamePhase.PlayerPrompts or self.get_player(sid) is None:
+            return
+        if sid in self.submission_tickets:
+            return
+
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            return
+
+        self.prompts[sid] = clean_prompt
+        self.submission_tickets[sid] = self.image_generator.request_generation(
+            clean_prompt,
+            callback=self.receive_submission_finished_generating,
+        )
+        self.emit("display_waiting_screen", {
+            "state": "Generating your match. Keep an eye on the TV.",
+            "image": self.get_random_animation(),
+        }, to=sid)
+        self.emit_target()
+        self.check_submissions_complete()
+
+    def receive_vote(self, sid, voted_for):
+        if self.phase != GamePhase.VoteClosest or self.get_player(sid) is None:
+            return
+        if sid in self.votes:
+            return
+        if voted_for < 0 or voted_for >= len(self.card_order):
+            return
+        selected_sid = self.card_order[voted_for]
+        self.votes[sid] = selected_sid
+        self.emit("display_waiting_screen", {
+            "state": "Vote locked. Waiting for everyone else.",
+            "image": self.get_random_animation(),
+        }, to=sid)
+        self.check_votes_complete()
+
+    def receive_proceed_active_player(self, sid):
+        return
+
+    def receive_target_finished_generating(self, image_num, image_path, anim_path):
+        with self.app.app_context():
+            if self.phase != GamePhase.TargetImageWait or image_num != self.target_image_ticket:
+                return
+            self.target_image = image_path
+            self.phase = GamePhase.PlayerPrompts
+            self.emit_target()
+            for player in self.players:
+                self.emit("display_prompt", {
+                    "mode": "match",
+                    "promptInfo": "Write a prompt to recreate the target image on the TV.",
+                    "target_image": self.target_image,
+                    "challenge": self.challenges.get(player.sid),
+                }, to=player.sid)
+
+    def receive_submission_finished_generating(self, image_num, image_path, anim_path):
+        with self.app.app_context():
+            if self.phase not in (GamePhase.PlayerPrompts, GamePhase.PlayerImageWait):
+                return
+            for sid, ticket in self.submission_tickets.items():
+                if ticket == image_num:
+                    self.submission_images[sid] = image_path
+                    break
+            self.check_submissions_complete()
+
+    def check_submissions_complete(self):
+        if self.phase not in (GamePhase.PlayerPrompts, GamePhase.PlayerImageWait):
+            return
+        if len(self.submission_tickets) == len(self.players):
+            self.phase = GamePhase.PlayerImageWait
+        if len(self.submission_images) == len(self.players) and self.players:
+            self.phase = GamePhase.VoteClosest
+            self.create_images_list()
+            self.emit_vote_screen()
+
+    def check_votes_complete(self):
+        if self.phase == GamePhase.VoteClosest and len(self.votes) == len(self.players):
+            self.phase = GamePhase.ShowResults
+            self.score_votes()
+            self.show_results()
+
+    def score_votes(self):
+        tallies = {player.sid: 0 for player in self.players}
+        for voted_sid in self.votes.values():
+            if voted_sid in tallies:
+                tallies[voted_sid] += 1
+
+        highest_votes = max(tallies.values()) if tallies else 0
+        winners = {sid for sid, count in tallies.items() if count == highest_votes and highest_votes > 0}
+        self.round_scores = {}
+
+        for player in self.players:
+            round_score = tallies[player.sid]
+            if player.sid in winners:
+                round_score += 3
+            self.round_scores[player.sid] = round_score
+            player.score += round_score
+
+    def show_results(self):
+        for player in self.players:
+            self.emit("player_display_results", {
+                "message": "Round complete",
+                "player_round_score": self.round_scores.get(player.sid, 0),
+                "player_total_score": player.score,
+            }, to=player.sid)
+
+        image_info = []
+        for sid in self.card_order:
+            player = self.get_player(sid)
+            if player is None:
+                continue
+            votes = [
+                self.get_player(voter_sid).nickname
+                for voter_sid, voted_sid in self.votes.items()
+                if voted_sid == sid and self.get_player(voter_sid) is not None
+            ]
+            image_info.append({
+                "image": self.submission_images[sid],
+                "votes": votes,
+                "is_winner": self.round_scores.get(sid, 0) >= max(self.round_scores.values()),
+                "prompt": self.prompts.get(sid, ""),
+                "author": player.nickname,
+                "challenge": self.challenges.get(sid),
+                "score": player.score,
+                "round_score": self.round_scores.get(sid, 0),
+            })
+
+        player_scores = [{
+            "name": player.nickname,
+            "round_score": self.round_scores.get(player.sid, 0),
+            "total_score": player.score,
+        } for player in self.players]
+        player_scores.sort(key=lambda p: p["total_score"], reverse=True)
+
+        for tv in self.tvs:
+            self.emit("tv_display_results", {
+                "target_image": self.target_image,
+                "target_prompt": self.target_prompt,
+                "images": image_info,
+                "players": player_scores,
+            }, to=tv)
+
+        self.round_timer = threading.Thread(target=self.sleep_and_start_next_round, daemon=True)
+        self.round_timer.start()
+
+    def sleep_and_start_next_round(self):
+        sleep(15)
+        with self.app.app_context():
+            if self.players and self.phase == GamePhase.ShowResults:
+                self.start_game()
+
+    def emit_lobby(self, to=None):
+        payload = {
+            "names": [player.nickname for player in self.players + self.pending_players],
+        }
+        recipients = [to] if to is not None else self.tvs
+        for tv in recipients:
+            self.emit("tv_show_player_list", payload, to=tv)
+
+    def emit_target(self, to=None):
+        payload = {
+            "target_image": self.target_image,
+            "round_number": self.round_number,
+            "submitted_count": len(self.submission_tickets),
+            "player_count": len(self.players),
+        }
+        recipients = [to] if to is not None else self.tvs
+        for tv in recipients:
+            self.emit("tv_show_target", payload, to=tv)
+
+    def emit_vote_screen(self):
+        images = [{
+            "image": self.submission_images[sid],
+            "index": index,
+            "is_own": False,
+        } for index, sid in enumerate(self.card_order) if self.get_player(sid) is not None]
+
+        for tv in self.tvs:
+            self.emit("tv_show_cards_vote", {
+                "target_image": self.target_image,
+                "images": images,
+            }, to=tv)
+
+        for player in self.players:
+            options = []
+            for index, sid in enumerate(self.card_order):
+                options.append({"index": index})
+            self.emit("display_vote", {
+                "options": options,
+                "number": len(self.card_order),
+            }, to=player.sid)
+
+    def emit_waiting_to_all(self, state):
+        payload = {
+            "state": state,
+            "image": self.get_random_animation(),
+        }
+        for player in self.players:
+            self.emit("display_waiting_screen", payload, to=player.sid)
+        for tv in self.tvs:
+            self.emit("display_waiting_screen", payload, to=tv)
+
+    def create_images_list(self):
+        self.card_order = list(self.submission_images.keys())
+        random.shuffle(self.card_order)
+        self.images = [self.submission_images[sid] for sid in self.card_order]
+
+    def assign_challenges(self):
+        shuffled = CHALLENGES[:]
+        random.shuffle(shuffled)
+        self.challenges = {}
+        for index, player in enumerate(self.players):
+            self.challenges[player.sid] = shuffled[index % len(shuffled)]
+
+    def get_player(self, sid):
         for player in self.players:
             if player.sid == sid:
                 return player
+        return None
 
-    def get_random_animation(self) -> str:
-        premade_animations = [f"premade_animations/{n}.gif" for n in range(5)]
-        if len(self.anims_prev_rounds) == 0:
-            return random.choice(premade_animations)
-        else:
-            return random.choice(self.anims_prev_rounds)
+    def get_random_animation(self):
+        return f"premade_animations/{random.randrange(5)}.gif"
 
-    def receive_prompt(self, id, prompt):
-        #If the phase is the active players picking
-        if self.phase == GamePhase.ActivePlayerPrompt:
-            #if the id matches the active player
-            if id == self.get_active_player().sid:
-                #generate an image, and switch states after done waiting
-                self.active_players_image_ticket = self.image_generator.request_generation(prompt, callback=self.receive_image_finished_generating)
-                self.prompts[id] = prompt
-                self.phase = GamePhase.ActivePlayerImageWait
-                self.phase.trigger_state(self)
-
-        #else its someone elses turn
-        elif self.phase == GamePhase.AllPlayersPrompt:
-            self.prompts[id] = prompt
-            player = self.get_player(id)
-            #get the image from the library
-            self.other_players_image_tickets[player.sid] = self.image_generator.request_generation(prompt, callback=self.receive_image_finished_generating)
-            if len(self.other_players_image_tickets) == len(self.players) - 1:   #If done, then change the state
-                self.phase = GamePhase.AllPlayersImageWait
-                self.phase.trigger_state(self)
-            else:
-                emit("display_waiting_screen", {
-                    "state": "Please wait for the images to generate!",
-                    "image": self.get_random_animation()
-                })
-
-    def receive_proceed_active_player(self, sid):
-        active_player_sid = self.players[self.active_player].sid    #Checking the active players ID
-
-        if sid == active_player_sid:    # If the player is the active one, switch states
-            self.phase = GamePhase.AllPlayersPrompt
-            self.phase.trigger_state(self)
-
-    def receive_image_finished_generating(self, image_num, image_path, anim_path):
-        with self.app.app_context():
-            self.anims_this_round.append(anim_path)
-
-            if self.phase == GamePhase.ActivePlayerImageWait:
-                if self.active_players_image_ticket == image_num:
-                    self.active_players_image = image_path
-                    self.phase = GamePhase.ActivePlayerGiveClue
-                    self.phase.trigger_state(self)
-            elif self.phase in (GamePhase.AllPlayersImageWait, GamePhase.AllPlayersPrompt):
-                for player_id, player_image_ticket in self.other_players_image_tickets.items():
-                    if player_image_ticket == image_num:
-                        self.other_players_images[player_id] = image_path
-
-                if len(self.other_players_images) == len(self.players) - 1:
-                    self.phase = GamePhase.SelectActiveImage
-                    self.phase.trigger_state(self)
-
-    def receive_vote(self, sid, voted_for):
-        #Find the player who voted
-        current_player = None
-        for player in self.players:
-            if player.sid == sid:
-                current_player = player
-        
-        #Set the votes dict(player -> id)
-        voted_for = self.card_order[voted_for]
-        self.votes[current_player] = voted_for
-        if len(self.votes) == len(self.players) - 1:
-            self.phase = GamePhase.ShowResults
-            self.score_votes()
-            self.phase.trigger_state(self)
-    
-    def score_votes(self):
-        #Initialize tallies, keeps track of votes for each player
-        tallies = {player.sid : 0 for player in self.players}
-
-        #Increment tallies
-        for vote in self.votes.values():
-            tallies[vote] += 1
-        active_sid = self.players[self.active_player].sid     # Get the active Players Sid
-
-        #If No one voted for the active player
-        if tallies[active_sid] in (0, len(self.players) - 1):
-            for player in self.players:
-                if not player == self.players[self.active_player]:
-                    self.round_scores[player] = 2 + tallies[player.sid]
-            self.round_scores[self.get_active_player()] = 0
-
-        #If at least one person voted for the active player
-        else:
-            for player in self.players:
-                if player == self.players[self.active_player]:
-                    self.round_scores[player] = 3
-                else:
-                    if self.votes[player] == active_sid:
-                        self.round_scores[player] = 3 + tallies[player.sid]
-                    else: 
-                        self.round_scores[player] = tallies[player.sid]
-
-        for player, round_score in self.round_scores.items():
-            player.score += round_score
-
-
-    def get_active_player(self):
-        return self.players[self.active_player]
-
-    def active_player_write_prompt(self):
-        active_player = self.get_active_player()    #Get the active player
-
-        emit("display_prompt",{
-            "isActive": True
-        }, to=active_player.sid, namespace="/")
-
-        #Display the waiting screen for everyone other than the active player
-        for player in self.players:
-            if player.sid != active_player.sid:
-                emit("display_waiting_screen", {
-                    "state": "Wait for the active player to pick a prompt.",
-                    "image": self.get_random_animation()
-                }, to=player.sid, namespace="/")
-
-        for tv in self.tvs:
-            emit("display_waiting_screen", {
-                "state": "Wait for the active player to pick a prompt.",
-                "image": self.get_random_animation()
-            }, to=tv, namespace="/")
-
-    def active_player_wait(self):
-        for player in self.players:
-            emit("display_waiting_screen", {
-                "state": "Please wait for the images to generate",
-                "image": self.get_random_animation()
-            }, to=player.sid)
-
-        for tv in self.tvs:
-            emit("display_waiting_screen", {
-                "state": "Please wait for the image to generate.",
-                "image": self.get_random_animation()
-            }, to=tv)
-
-
-    def active_player_give_clue(self):
-        active_player = self.get_active_player()
-
-        emit("display_active_player_ok", {
-            "image": self.active_players_image
-        }, to=active_player.sid, namespace="/")
-
-        for player in self.players:
-            if player.sid != active_player.sid:
-                emit("display_waiting_screen", {
-                    "state": "Pay attention to the active player for a clue."
-                }, to=player.sid, namespace="/")
-
-        for tv in self.tvs:
-            emit("display_waiting_screen", {
-                "state": "Pay attention to the active player for a clue."
-            }, to=tv, namespace="/")
-
-    def non_active_players_give_prompt(self):
-        active_player = self.get_active_player()
-
-        emit("display_waiting_screen", {
-            "text": "Please wait for other players to choose an image.",
-            "state": "Please wait for other players to choose an image.",
-            "image": self.get_random_animation()
-        }, to=active_player.sid)
-
-        for player in self.players:
-            if player.sid != active_player.sid:
-                emit("display_prompt",
-                     {"isActive": False},
-                to=player.sid)
-
-        for tv in self.tvs:
-            emit("display_waiting_screen", {
-                "state": "Please wait for the prompt.",
-                "image": self.get_random_animation()
-            }, to=tv)
-
-    def non_active_players_wait(self):
-        for player in self.players:
-            emit("display_waiting_screen", {
-                "state": "Please wait for the images to generate.",
-                "image": self.get_random_animation()
-            }, to=player.sid)
-
-        for tv in self.tvs:
-            emit("display_waiting_screen", {
-                "state": "Please wait for the images to generate.",
-                "image": self.get_random_animation()
-            }, to=tv)
-
-    def non_active_players_vote(self):
-        active_player = self.get_active_player()
-
-        emit("display_waiting_screen", {
-            "state": "The other players are voting!",
-            "image": self.get_random_animation()
-        }, to=active_player.sid, namespace="/")
-
-        for player in self.players:
-            if player.sid != active_player.sid:
-                emit("display_vote", {
-                    "number": len(self.players)
-                }, to=player.sid, namespace="/")
-
-        self.create_images_list()
-
-        for tv in self.tvs:
-            emit("tv_show_cards_vote", {
-                "state": "Please wait for the images to generate.",
-                "images": self.images
-            }, to=tv, namespace="/")
-
-    def create_images_list(self):
+    def reset_round_state(self):
+        self.target_prompt = None
+        self.target_image_ticket = None
+        self.target_image = None
+        self.submission_tickets = {}
+        self.submission_images = {}
         self.card_order = []
-        self.images = []
-
-        for sid, img in self.other_players_images.items():
-            self.card_order.append(sid)
-            self.images.append(img)
-
-        active_player = self.get_active_player()
-        active_player_image = self.active_players_image
-
-        self.card_order.append(active_player.sid)
-        self.images.append(active_player_image)
-
-        c = list(zip(self.card_order, self.images))
-        random.shuffle(c)
-        self.card_order, self.images = zip(*c)
-
-    def show_results(self):
-        tallies = {player.sid : 0 for player in self.players}
-
-        #Increment tallies
-        for vote in self.votes.values():
-            tallies[vote] += 1
-        active_sid = self.players[self.active_player].sid    # Get the active Players Sid
-
-        scores = {}
-
-        for player in self.players:
-            scores[player.nickname] = player.score
-            
-
-        #If No one voted for the active player
-        if tallies[active_sid] == 0:
-            result = "nobody"
-        elif tallies[active_sid] == len(self.players) - 1:
-            result = "everybody"
-        else:
-            result = "split"
-        for player in self.players:
-            guess_active = player in self.votes and self.votes[player] == self.get_active_player().sid
-            results = {
-                "is_active_player": player.sid == active_sid,
-                "result": result,
-                "player_round_score": self.round_scores[player],
-                "player_total_score": player.score,
-                "guessed_active_player": guess_active,
-                "num_bonus_votes" : tallies[player.sid]
-            }
-            emit("player_display_results",results,to=player.sid)
-
-        tv_image_info = []
-        for sid, image in zip(self.card_order, self.images):
-            player = [p for p in self.players if p.sid == sid][0]
-            tv_image_info.append({
-                "image": image,
-                "votes": [player.nickname for player in self.players if player.sid != active_sid and self.votes[player] == sid],
-                "is_active_player": active_sid == sid,
-                "prompt": self.prompts[sid],
-                "author": self.get_player(sid).nickname,
-                "score": player.score,
-                "round_score": self.round_scores[player]
-            })
-
-        player_scores = []
-        for player in self.players:
-            player_scores.append({
-                "name": player.nickname,
-                "round_score": self.round_scores[player],
-                "total_score": player.score
-            })
-
-        player_scores.sort(key=lambda p: p["total_score"])
-
-        for tv in self.tvs:
-            emit("tv_display_results", {
-                "images": tv_image_info,
-                "players": player_scores,
-            },to=tv)
-
-
-        def sleep_and_reset():
-            sleep(15)
-            with self.app.app_context():
-                self.reset()
-
-
-
-        threading.Thread(target=sleep_and_reset).start()
-        #sleep(15)
-        #self.reset()
-
-    def reset(self):
-        self.active_player = (self.active_player + 1) % len(self.players)
-        self.active_players_image = None
-        self.active_players_image_ticket = None
-        self.other_players_images = {}
-        self.other_players_image_tickets = {}
-        self.card_order = None
         self.votes = {}
         self.round_scores = {}
-        self.anims_prev_rounds.extend(self.anims_this_round)
-        self.anims_this_round = []
-        self.images = None
-        self.phase = GamePhase.ActivePlayerPrompt
-        self.phase.trigger_state(self)
+        self.images = []
+        self.prompts = {}
+        self.challenges = {}
 
-    def add_player(self, player):
-        if self.phase == GamePhase.WaitingToStart:
-            self.players.append(player)
-            emit("display_waiting_screen", {
-                "state": "Wait for the game to begin.",
-                "image": self.get_random_animation()
-            })
-
-            for tv in self.tvs:
-                emit("tv_show_player_list", {
-                    "names": [p.nickname for p in self.players]
-                }, to=tv)
-
-
-
-
-        
-
-        
-if __name__ == "__main__":
-    GameState()
+    def reset_to_lobby(self):
+        self.phase = GamePhase.WaitingToStart
+        self.round_number = 0
+        self.reset_round_state()
+        self.emit_lobby()

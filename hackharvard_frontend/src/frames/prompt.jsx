@@ -3,6 +3,7 @@ import "src/App.css"
 import "./prompt.css"
 import socket from "../socketConfig.jsx";
 import {useState} from "react";
+import {backend_url} from "../backendUrl.jsx";
 
 function Prompt(props) {
 
@@ -19,7 +20,7 @@ function Prompt(props) {
       socket.emit("enter_prompt", {
         "prompt": inputText
       })
-      console.log("active player prompt submitted");
+      console.log("prompt submitted");
     }
   }
 
@@ -28,17 +29,23 @@ function Prompt(props) {
   }
 
   var promptInfo;
-  if (props.info.isActive) {
-    promptInfo = "You are the active player! Enter any prompt to describe an image."
-  } else {
-    promptInfo = "Enter a prompt to visualize the active players clue!"
-  }
+  promptInfo = props.info.promptInfo || "Write a prompt that recreates the target image on the TV.";
+  const challenge = props.info.challenge;
 
   return (
     <div id="prompt_container">
       <div id="prompt_info" className="info_text">
         {promptInfo}
       </div>
+      {challenge && (
+        <div id="challenge_card">
+          <div id="challenge_title">{challenge.title}</div>
+          <div id="challenge_description">{challenge.description}</div>
+        </div>
+      )}
+      {props.info.target_image && (
+        <img className="prompt_target_image" src={backend_url + props.info.target_image} alt="Target" />
+      )}
       <input style={inputStyles} onChange={handleChange} />
       <Button label={"Submit"} onClick={handlePromptSubmit} clickable={inputText.length > 0}></Button>
     </div >

@@ -1,3 +1,6 @@
 env/
+.venv/
 weights/
+images/
+animations/
 *.pyc
