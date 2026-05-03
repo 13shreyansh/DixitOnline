@@ -1,4 +1,5 @@
 from multiprocessing import freeze_support
+import os
 from pathlib import Path
 
 from flask import Flask, request, send_from_directory, send_file
@@ -84,4 +85,5 @@ def disconnect(reason=None):
 if __name__ == "__main__":
     freeze_support()
     game_state = GameState(app, socketio)
-    socketio.run(app, debug=False, host='0.0.0.0', port = 5001)
+    port = int(os.environ.get("PORT", 5001))
+    socketio.run(app, debug=False, host='0.0.0.0', port=port)

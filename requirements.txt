@@ -1,9 +1,4 @@
-diffusers
-transformers
-scipy
-ftfy
-jupyter
 flask
 flask-socketio
 openai
---pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+simple-websocket

@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: prompt-match
+    runtime: python
+    plan: free
+    buildCommand: npm --prefix hackharvard_frontend ci && npm --prefix hackharvard_frontend run build && pip install -r requirements.txt
+    startCommand: python -m stablediffusion_dixit.backend.endpoints
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
