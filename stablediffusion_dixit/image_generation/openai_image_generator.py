@@ -17,7 +17,7 @@ from stablediffusion_dixit.image_generation.mock_image_generator import (
 
 class OpenAIImageGenerator(ImageGenerator):
     def __init__(self):
-        self.client = OpenAI()
+        self.client = OpenAI(timeout=float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "45")))
         self.models = [
             model.strip()
             for model in os.environ.get("OPENAI_IMAGE_MODELS", "gpt-image-1-mini,gpt-image-1,dall-e-3").split(",")

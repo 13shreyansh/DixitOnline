@@ -135,6 +135,11 @@ class GameState:
     def add_player(self, player):
         if self.get_player(player.sid) is not None:
             return
+        reconnecting_player = self.get_round_player_by_name(player.nickname)
+        if reconnecting_player is not None and self.phase != GamePhase.WaitingToStart:
+            self.replace_round_player_sid(reconnecting_player.sid, player)
+            self.emit_current_player_screen(player.sid)
+            return
         if self.phase == GamePhase.WaitingToStart:
             self.players.append(player)
             self.emit("display_waiting_screen", {
@@ -142,21 +147,6 @@ class GameState:
                 "image": self.get_random_animation(),
             }, to=player.sid)
             self.emit_lobby()
-        elif self.phase in (GamePhase.TargetImageWait, GamePhase.PlayerPrompts):
-            self.players.append(player)
-            if self.phase == GamePhase.PlayerPrompts and self.target_image is not None:
-                self.emit("display_prompt", {
-                    "mode": "match",
-                    "promptInfo": "Write a prompt to recreate the target image on the TV.",
-                    "target_image": self.target_image,
-                    "challenge": self.challenges.get(player.sid),
-                }, to=player.sid)
-                self.emit_target()
-            else:
-                self.emit("display_waiting_screen", {
-                    "state": "Generating the target image.",
-                    "image": self.get_random_animation(),
-                }, to=player.sid)
         else:
             self.pending_players.append(player)
             self.emit("display_waiting_screen", {
@@ -192,15 +182,11 @@ class GameState:
             self.reset_to_lobby()
             return
 
+        self.remove_round_sid(sid)
         if self.phase == GamePhase.WaitingToStart:
             self.emit_lobby()
         elif self.phase in (GamePhase.PlayerPrompts, GamePhase.PlayerImageWait, GamePhase.VoteClosest):
-            self.prompts.pop(sid, None)
-            self.submission_tickets.pop(sid, None)
-            self.submission_images.pop(sid, None)
-            self.votes.pop(sid, None)
             if self.phase == GamePhase.VoteClosest:
-                self.card_order = [player_sid for player_sid in self.card_order if player_sid != sid]
                 self.emit_vote_screen()
                 self.check_votes_complete()
             else:
@@ -218,9 +204,12 @@ class GameState:
 
         self.round_number += 1
         self.reset_round_state()
+        self.round_player_sids = [player.sid for player in self.players]
+        self.round_player_names = {player.sid: player.nickname for player in self.players}
         self.assign_challenges()
         self.phase = GamePhase.TargetImageWait
         self.target_prompt = random.choice(TARGET_PROMPTS)
+        self.log(f"round {self.round_number} starting with {len(self.round_player_sids)} players")
         self.target_image_ticket = self.image_generator.request_generation(
             self.target_prompt,
             callback=self.receive_target_finished_generating,
@@ -228,7 +217,7 @@ class GameState:
         self.emit_waiting_to_all("Generating the target image.")
 
     def receive_prompt(self, sid, prompt):
-        if self.phase != GamePhase.PlayerPrompts or self.get_player(sid) is None:
+        if self.phase != GamePhase.PlayerPrompts or sid not in self.round_player_sids:
             return
         if sid in self.submission_tickets:
             return
@@ -238,6 +227,7 @@ class GameState:
             return
 
         self.prompts[sid] = clean_prompt
+        self.log(f"prompt received from {self.round_player_names.get(sid, sid)}")
         self.submission_tickets[sid] = self.image_generator.request_generation(
             clean_prompt,
             callback=self.receive_submission_finished_generating,
@@ -250,7 +240,7 @@ class GameState:
         self.check_submissions_complete()
 
     def receive_vote(self, sid, voted_for):
-        if self.phase != GamePhase.VoteClosest or self.get_player(sid) is None:
+        if self.phase != GamePhase.VoteClosest or sid not in self.round_player_sids:
             return
         if sid in self.votes:
             return
@@ -273,8 +263,9 @@ class GameState:
                 return
             self.target_image = image_path
             self.phase = GamePhase.PlayerPrompts
+            self.log("target image ready; asking players for prompts")
             self.emit_target()
-            for player in self.players:
+            for player in self.get_round_players():
                 self.emit("display_prompt", {
                     "mode": "match",
                     "promptInfo": "Write a prompt to recreate the target image on the TV.",
@@ -289,27 +280,32 @@ class GameState:
             for sid, ticket in self.submission_tickets.items():
                 if ticket == image_num:
                     self.submission_images[sid] = image_path
+                    self.log(f"submission image ready for {self.round_player_names.get(sid, sid)}")
                     break
             self.check_submissions_complete()
 
     def check_submissions_complete(self):
         if self.phase not in (GamePhase.PlayerPrompts, GamePhase.PlayerImageWait):
             return
-        if len(self.submission_tickets) == len(self.players):
+        expected_sids = self.round_player_sids
+        if not expected_sids:
+            return
+        if all(sid in self.submission_tickets for sid in expected_sids):
             self.phase = GamePhase.PlayerImageWait
-        if len(self.submission_images) == len(self.players) and self.players:
+        if all(sid in self.submission_images for sid in expected_sids):
             self.phase = GamePhase.VoteClosest
             self.create_images_list()
+            self.log(f"all {len(self.card_order)} submissions ready; opening voting")
             self.emit_vote_screen()
 
     def check_votes_complete(self):
-        if self.phase == GamePhase.VoteClosest and len(self.votes) == len(self.players):
+        if self.phase == GamePhase.VoteClosest and all(sid in self.votes for sid in self.round_player_sids):
             self.phase = GamePhase.ShowResults
             self.score_votes()
             self.show_results()
 
     def score_votes(self):
-        tallies = {player.sid: 0 for player in self.players}
+        tallies = {sid: 0 for sid in self.card_order}
         for voted_sid in self.votes.values():
             if voted_sid in tallies:
                 tallies[voted_sid] += 1
@@ -318,12 +314,14 @@ class GameState:
         winners = {sid for sid, count in tallies.items() if count == highest_votes and highest_votes > 0}
         self.round_scores = {}
 
-        for player in self.players:
-            round_score = tallies[player.sid]
-            if player.sid in winners:
+        for sid in self.card_order:
+            round_score = tallies[sid]
+            if sid in winners:
                 round_score += 3
-            self.round_scores[player.sid] = round_score
-            player.score += round_score
+            self.round_scores[sid] = round_score
+            player = self.get_player(sid)
+            if player is not None:
+                player.score += round_score
 
     def show_results(self):
         for player in self.players:
@@ -334,23 +332,22 @@ class GameState:
             }, to=player.sid)
 
         image_info = []
+        highest_round_score = max(self.round_scores.values()) if self.round_scores else 0
         for sid in self.card_order:
             player = self.get_player(sid)
-            if player is None:
-                continue
             votes = [
-                self.get_player(voter_sid).nickname
+                self.round_player_names.get(voter_sid, "Disconnected player")
                 for voter_sid, voted_sid in self.votes.items()
-                if voted_sid == sid and self.get_player(voter_sid) is not None
+                if voted_sid == sid
             ]
             image_info.append({
                 "image": self.submission_images[sid],
                 "votes": votes,
-                "is_winner": self.round_scores.get(sid, 0) >= max(self.round_scores.values()),
+                "is_winner": self.round_scores.get(sid, 0) >= highest_round_score and highest_round_score > 0,
                 "prompt": self.prompts.get(sid, ""),
-                "author": player.nickname,
+                "author": self.round_player_names.get(sid, "Disconnected player"),
                 "challenge": self.challenges.get(sid),
-                "score": player.score,
+                "score": player.score if player is not None else self.round_scores.get(sid, 0),
                 "round_score": self.round_scores.get(sid, 0),
             })
 
@@ -387,11 +384,12 @@ class GameState:
             self.emit("tv_show_player_list", payload, to=tv)
 
     def emit_target(self, to=None):
+        expected_count = len(self.round_player_sids) if self.round_player_sids else len(self.players)
         payload = {
             "target_image": self.target_image,
             "round_number": self.round_number,
-            "submitted_count": len(self.submission_tickets),
-            "player_count": len(self.players),
+            "submitted_count": len([sid for sid in self.round_player_sids if sid in self.submission_tickets]),
+            "player_count": expected_count,
         }
         recipients = [to] if to is not None else self.tvs
         for tv in recipients:
@@ -402,7 +400,7 @@ class GameState:
             "image": self.submission_images[sid],
             "index": index,
             "is_own": False,
-        } for index, sid in enumerate(self.card_order) if self.get_player(sid) is not None]
+        } for index, sid in enumerate(self.card_order)]
 
         for tv in self.tvs:
             self.emit("tv_show_cards_vote", {
@@ -410,7 +408,7 @@ class GameState:
                 "images": images,
             }, to=tv)
 
-        for player in self.players:
+        for player in self.get_round_players():
             options = []
             for index, sid in enumerate(self.card_order):
                 options.append({"index": index})
@@ -430,7 +428,7 @@ class GameState:
             self.emit("display_waiting_screen", payload, to=tv)
 
     def create_images_list(self):
-        self.card_order = list(self.submission_images.keys())
+        self.card_order = [sid for sid in self.round_player_sids if sid in self.submission_images]
         random.shuffle(self.card_order)
         self.images = [self.submission_images[sid] for sid in self.card_order]
 
@@ -438,14 +436,110 @@ class GameState:
         shuffled = CHALLENGES[:]
         random.shuffle(shuffled)
         self.challenges = {}
-        for index, player in enumerate(self.players):
-            self.challenges[player.sid] = shuffled[index % len(shuffled)]
+        for index, sid in enumerate(self.round_player_sids):
+            self.challenges[sid] = shuffled[index % len(shuffled)]
 
     def get_player(self, sid):
         for player in self.players:
             if player.sid == sid:
                 return player
         return None
+
+    def get_round_players(self):
+        players = []
+        for sid in self.round_player_sids:
+            player = self.get_player(sid)
+            if player is not None:
+                players.append(player)
+        return players
+
+    def get_round_player_by_name(self, nickname):
+        for sid in self.round_player_sids:
+            player = self.get_player(sid)
+            if player is not None and player.nickname == nickname:
+                return player
+        return None
+
+    def replace_round_player_sid(self, old_sid, new_player):
+        player = self.get_player(old_sid)
+        if player is None:
+            return
+        player.sid = new_player.sid
+        self.round_player_sids = [new_player.sid if sid == old_sid else sid for sid in self.round_player_sids]
+        self.round_player_names[new_player.sid] = new_player.nickname
+        self.round_player_names.pop(old_sid, None)
+        self.challenges[new_player.sid] = self.challenges.pop(old_sid, None)
+
+        for mapping in (self.prompts, self.submission_tickets, self.submission_images, self.round_scores):
+            if old_sid in mapping:
+                mapping[new_player.sid] = mapping.pop(old_sid)
+
+        if old_sid in self.votes:
+            self.votes[new_player.sid] = self.votes.pop(old_sid)
+        self.votes = {
+            voter_sid: new_player.sid if voted_sid == old_sid else voted_sid
+            for voter_sid, voted_sid in self.votes.items()
+        }
+        self.card_order = [new_player.sid if sid == old_sid else sid for sid in self.card_order]
+        self.log(f"reconnected player {new_player.nickname}")
+
+    def remove_round_sid(self, sid):
+        if sid not in self.round_player_sids:
+            return
+        self.round_player_sids = [player_sid for player_sid in self.round_player_sids if player_sid != sid]
+        self.round_player_names.pop(sid, None)
+        self.prompts.pop(sid, None)
+        self.submission_tickets.pop(sid, None)
+        self.submission_images.pop(sid, None)
+        self.votes.pop(sid, None)
+        self.votes = {
+            voter_sid: voted_sid
+            for voter_sid, voted_sid in self.votes.items()
+            if voted_sid != sid
+        }
+        self.card_order = [player_sid for player_sid in self.card_order if player_sid != sid]
+
+    def emit_current_player_screen(self, sid):
+        if self.phase == GamePhase.TargetImageWait:
+            self.emit("display_waiting_screen", {
+                "state": "Generating the target image.",
+                "image": self.get_random_animation(),
+            }, to=sid)
+        elif self.phase == GamePhase.PlayerPrompts:
+            if sid in self.submission_tickets:
+                self.emit("display_waiting_screen", {
+                    "state": "Generating your match. Keep an eye on the TV.",
+                    "image": self.get_random_animation(),
+                }, to=sid)
+            else:
+                self.emit("display_prompt", {
+                    "mode": "match",
+                    "promptInfo": "Write a prompt to recreate the target image on the TV.",
+                    "target_image": self.target_image,
+                    "challenge": self.challenges.get(sid),
+                }, to=sid)
+        elif self.phase == GamePhase.PlayerImageWait:
+            self.emit("display_waiting_screen", {
+                "state": "Generating all matches. Keep an eye on the TV.",
+                "image": self.get_random_animation(),
+            }, to=sid)
+        elif self.phase == GamePhase.VoteClosest:
+            if sid in self.votes:
+                self.emit("display_waiting_screen", {
+                    "state": "Vote locked. Waiting for everyone else.",
+                    "image": self.get_random_animation(),
+                }, to=sid)
+            else:
+                options = [{"index": index} for index, _ in enumerate(self.card_order)]
+                self.emit("display_vote", {
+                    "options": options,
+                    "number": len(self.card_order),
+                }, to=sid)
+        else:
+            self.emit("display_waiting_screen", {
+                "state": "A round is already running. You will join the next one.",
+                "image": self.get_random_animation(),
+            }, to=sid)
 
     def get_random_animation(self):
         return f"premade_animations/{random.randrange(5)}.gif"
@@ -462,9 +556,14 @@ class GameState:
         self.images = []
         self.prompts = {}
         self.challenges = {}
+        self.round_player_sids = []
+        self.round_player_names = {}
 
     def reset_to_lobby(self):
         self.phase = GamePhase.WaitingToStart
         self.round_number = 0
         self.reset_round_state()
         self.emit_lobby()
+
+    def log(self, message):
+        print(f"[PromptMatch] {message}", flush=True)
